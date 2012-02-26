@@ -1,0 +1,661 @@
+#!/usr/bin/perl
+use strict;
+use warnings;
+
+# ABSTRACT: abstract!!!!
+# PODNAME: git-fancy!!!!
+
+use autodie;
+use Getopt::Long;
+use Pod::Usage;
+
+##### configuration variables #####
+#{{{
+my $COMPACT = 1;
+my $GAP = 2;
+my $SPLIT_MERGE = 1;
+my $VERBOSE = 0;
+my $COLOR = 1;
+
+my %opt = (
+        'compact'  => \$COMPACT,
+        'gap'     => \$GAP,
+        'split-merge'  => \$SPLIT_MERGE,
+        'verbose'   => \$VERBOSE,
+        'color' => \$COLOR,
+        );
+
+foreach my $k ( qw/compact split-merge color/ ) {
+    my $v = `git config fancygraph.$k`;
+    chomp $v;
+    if ( $v ne '' ) {
+        if ( $v =~ /^yes$/i ) {
+            ${$opt{$k}} = 1;
+        }
+        elsif ( $v =~ /^no$/i ) {
+            ${$opt{$k}} = 0;
+        }
+        else {
+            print "Invalid option fancygraph.$k = [$v]\n";
+            exit 1;
+        }
+    }
+}
+
+GetOptions(
+    \%opt,
+    'help|?'=> sub { pod2usage(-verbose => 1); },
+    'man'   => sub { pod2usage(-verbose => 2, -noperldoc => 1); },
+    'compact!',
+    'gap=i',
+    'split-merge!',
+    'verbose',
+    'color!',
+    'no-msg|nomsg|no-message|nomessage',
+) or pod2usage(2);
+
+local $| = 1 if $VERBOSE;
+#}}}
+
+
+
+
+##### global variables #####
+#{{{
+my $git_option = '--all';
+if ( @ARGV ) {
+    $git_option = join ' ', @ARGV;
+}
+
+# %commit = (
+#              sha-id => {
+#                            idx => num   # 타임라인에 등장하는 순서
+#                            sha_id_p => ID(for output),
+#                            msg => 'commit msg',
+#                            src => 'source refs'
+#                            src_p => 'source refs'(for output),
+#                            parents = [ sha, sha ];
+#                            head => 1   # 해당 브랜치의 마지막(가장 최근) 커밋인 경우
+#                            merge => 1  # merge 커밋일 경우
+#                        }
+#           )
+my %commit = ();
+
+# 최종 타임라인
+# @timeline = ( sha_id, sha_id, ... )
+my @timeline = ();
+
+# 분석에 사용될 패턴
+my $pat_color  = qr/(?:\e\[[;\d]*?m)/;
+my $pat_sha_id = qr/$pat_color?[0-9a-fA-F]{7}$pat_color?/;
+my $pat_gitlog_line = qr/^
+                        ((?:\s*?$pat_sha_id)+)         # sha-id's
+                        \s+
+                        ($pat_color?.+?$pat_color?)    # source
+                        \s
+                        (.+)                    # commit message
+                        $
+                        /x;
+
+# merge commit 들만 따로 모아둠
+# @merge_commits = ( commit, commit, ... )
+my @merge_commits = ();
+
+# 브랜치 별로 할당 컬럼과 색상 정보
+# %print = (
+#              refs-name => {
+#                              column => num,
+#                              color  => num,
+#                           }
+#           )
+my %print = ();
+
+# 할당된 가장 우측 컬럼
+my $usedcolumn = 0;
+# 사용하다가 반납한 컬럼
+# @returnedcolumn = ( [num, idx], [num, idx]... );
+my @returnedcolumn = ();
+
+#}}}
+
+
+
+
+
+##### subroutines #####
+
+# 각 브랜치에 부여할 새 색상값 반환
+{
+my $color = 0;
+sub next_color { #{{{
+    $color = (($color+1)%6);
+    $color++ if $color == 2;    # avoid yellow
+    return 1 + $color;
+} #}}}
+} # closure
+
+# $src : 기록할 브랜치 (필요없나?)
+# $idx : 요청하는 시점의 idx
+sub assign_col { #{{{
+    my ( $src, $idx ) = @_;
+
+    # 사용하다 반환된 컬럼이 있다면,
+    # 그 컬럼의 idx보다 현재 idx가 2이상 작으면 그걸 반환
+    if ( $COMPACT and @returnedcolumn ) {
+        for (my $i=0; $i<@returnedcolumn; $i++) {
+            if ( $returnedcolumn[$i][1] > $idx+1 ) {
+                my $ret = $returnedcolumn[$i][0];
+                splice @returnedcolumn, $i, 1;
+
+                verbose("    we can use col [$ret]\n");
+                return $ret;
+            }
+        }
+    }
+
+    # 반환된 컬럼에서 할당할 걸 못 찾았음
+    # 새 컬럼 추가
+    verbose("    new column number [$usedcolumn]\n");
+    return $usedcolumn++;
+} #}}}
+
+# 사용된 가장 마지막 컬럼 번호 반환
+sub max_col { #{{{
+    return $usedcolumn - 1;
+} #}}}
+
+# $col - 반환할 컬럼
+# $idx - 해당 컬럼이 몇번째 idx까지 쓰이는가
+#        - child가 없는 커밋이라면 그 커밋의 idx
+#        - merge된다면 그 merge커밋의 idx
+sub free_col { #{{{
+    my ($col, $idx) = @_;
+
+    push @returnedcolumn, [ $col, $idx ];
+
+    return;
+} #}}}
+
+# $sym을 $color값의 색상으로 반환
+sub colored_symbol { #{{{
+    my ( $sym, $color ) = @_;
+
+    return "\e[${color}m$sym\e[m" if $COLOR;
+    return $sym;
+} #}}}
+
+# $root 커밋부터 시작해서, parents 들을 너비 우선 방식으로 찾으면서
+# $ca 커밋 직전까지 만나는 커밋들의 브랜치 이름을 $old에서 $new로 바꿈
+sub rename_src { #{{{
+    my ( $root, $old, $new, $ca ) = @_;
+
+    return unless exists $commit{$root};
+
+    my @stack = ( $root );
+    while ( @stack ) {
+        my $id = shift @stack;
+
+        if ( exists $commit{$id} and $commit{$id}{'src'} eq $old ) {
+            verbose("  rename [$id] to [$new]\n");
+            $commit{$id}{'src'} = $new;
+        }
+        else {
+            next;     # 해도 되나?
+        }
+
+        foreach my $p ( @{$commit{$id}{'parents'}} ) {
+            next if ( $p eq $ca );
+
+            push @stack, $p;
+        }
+    }
+
+} #}}}
+
+# verbose 출력
+sub verbose { #{{{
+    my $str = shift;
+    return unless $VERBOSE;
+    $str =~ s/$pat_color//g unless $COLOR;
+    print $str;
+} #}}}
+
+
+
+
+
+##### main #####
+
+
+# 앞에서부터 읽으면서, 커밋의 기본 정보 수집
+verbose("PHASE 1 : read git log with '--parents'...\n");
+{ #{{{
+    my $idx = 0;
+    open my $git, "-|", "git log --oneline --decorate --color=always --source --parents --date-order $git_option";
+    while (my $line = <$git>) {
+        chomp $line;
+
+        if ( $line =~ /$pat_gitlog_line/ ) {
+            my ( $sha_block_p, $src_p, $msg ) = ( $1, $2, $3, $4 );
+
+            $sha_block_p =~ s/^\s+//;
+            my @sha_block_p = split /\s+/, $sha_block_p;
+            (my $sha_block = $sha_block_p) =~ s/$pat_color//g;
+            my @sha_block = split /\s+/, $sha_block;
+
+            my $sha_id   = shift @sha_block;
+            my $sha_id_p = shift @sha_block_p;
+
+            $src_p =~ s{^($pat_color?)refs/}{$1}g;
+            (my  $src = $src_p) =~ s/$pat_color//g;
+
+            # 커밋 정보 구성
+            @{$commit{$sha_id}}{ qw/idx sha_id_p msg src src_p parents/ } =
+                ( ++$idx, $sha_id_p, $msg, $src, $src_p, [ @sha_block ] );
+            if ( not exists $commit{$sha_id}{'children'} ) {
+                $commit{$sha_id}{'children'} = [ ];
+            }
+
+            push @timeline, $sha_id;
+            verbose("  add commit [$idx][$sha_id][$src][$msg]\n");
+
+            # parents 커밋들에게 children 정보 제공
+            foreach my $id ( @sha_block ) {
+                push @{$commit{$id}{'children'}}, $sha_id;
+            }
+
+            # merge commit 표시
+            if (2 <= @{$commit{$sha_id}{'parents'}}) {
+                $commit{$sha_id}{'merge'} = 1;
+
+                push @merge_commits, $commit{$sha_id};
+            }
+        }
+    }
+    close $git;
+} #}}}
+verbose("PHASE 1 : done.\n\n\n");
+
+
+
+# children 정보만 있고 다른 정보는 없는 커밋들이 생겼을 수 있다. 제거
+foreach my $id ( keys %commit ) { #{{{
+    unless ( exists $commit{$id}{'idx'} ) {
+        delete $commit{$id};
+    }
+} #}}}
+
+# merge가 되었지만 둘 다 동일한 source 인 경우 이름을 달리 붙여줄 방법을 찾자
+if ( $SPLIT_MERGE ) { #{{{
+    verbose("PHASE 2 : rename merged commits...\n");
+
+    my %lastnum = ();   # 각 브랜치마다 뒤에 번호를 몇까지 붙였는지
+    foreach my $cmt ( @merge_commits ) {
+
+        if ( $VERBOSE ) {
+            (my $cmtid = $cmt->{'sha_id_p'} ) =~ s/$pat_color//g;
+            print "Check merge commit [$cmtid].....\n";
+        }
+
+        my $src = $cmt->{'src'};
+        my @parents = @{$cmt->{'parents'}};
+        my $first_id = shift @parents;
+        my $basename;
+
+        # 만의 하나 원래의 브랜치 이름이 "xxxx'숫자"의 형태라면
+        # 오동작한다.
+        if ( $src =~ /^(.+?)(?:'(\d+))?$/ ) {
+            $basename = $1;
+
+            if ( not exists $lastnum{$basename} ) {
+                $lastnum{$basename} = 2;
+            }
+        }
+        else {
+            die "Assertion failed: branch name [$src]";
+        }
+
+        foreach my $p_id ( @parents ) {
+            next unless exists $commit{$p_id};
+            if ( $src eq $commit{$p_id}{'src'} ) {
+                my $common_ancestor = `git merge-base $first_id $p_id`;
+                $common_ancestor = substr($common_ancestor, 0, 7);
+
+                my $newsrc = $basename."'".$lastnum{$basename};
+                $lastnum{$basename}++;
+
+                verbose("rename commits from [$p_id] before [$common_ancestor] as [$newsrc]\n");
+                rename_src( $p_id, $src, $newsrc, $common_ancestor );
+            }
+        }
+    }
+    verbose("PHASE 2 : done.\n\n\n");
+} #}}}
+
+
+
+# 역순으로 읽어나가면서 컬럼 할당
+verbose("PHASE 3 : assign column and color to each branch...\n");
+# config 값에 의한 미리 설정
+{
+    my $conf = `git config fancygraph.fixcolumn`;
+    chomp $conf;
+    foreach my $src ( split /\s+/, $conf ) {
+        $print{"heads/$src"}{'column'} = assign_col($src, 0);
+        $print{"heads/$src"}{'color' } = next_color();
+    }
+}
+my $last_color = -1;
+foreach my $id ( reverse @timeline ) { #{{{
+    my $cmt = $commit{$id};
+    my $src = $cmt->{'src'};
+
+    # 새로 나타난 브랜치
+    # 새 컬럼, 색상 할당
+    if ( not defined $print{$src} ) {
+        # 자신의 부모 커밋 중 가장 아래쪽에 있는 커밋의 idx를 얻어서,
+        # 그 idx 이후로 사용할 수 있는 컬럼을 할당받는다
+        my $bottom = $cmt->{'idx'};
+        foreach my $id ( @{$cmt->{'parents'}} ) {
+            next unless exists $commit{$id};
+            if ( $cmt->{'idx'} == @timeline ) { next; }
+            if ( $bottom < $commit{$id}{'idx'} ) {
+                $bottom = $commit{$id}{'idx'};
+            }
+        }
+        my $new_col = assign_col($src, $bottom);
+        $print{$src}{'column'} = $new_col;
+        verbose("  assign column [$new_col] to [$id][$cmt->{msg}] / [$src]\n");
+
+        # 새 색상
+        $print{$src}{'color'}  = next_color();
+        # 직전 커밋의 색상과 다르게 결정
+        while ( $print{$src}{'color'} == $last_color ) {
+            $print{$src}{'color'} = next_color();
+        }
+    }
+
+    # head commit
+    # 각 브랜치의 마지막 커밋
+    if (not grep { exists $commit{$_} and $src eq $commit{$_}{'src'} } @{$cmt->{'children'}}) {
+        $cmt->{'head'} = 1;
+
+        # 다른 브랜치에 merge될 수 있으니 children 중에 가장 위에 있는 merge 커밋의 idx를 찾는다
+        my $top = $cmt->{'idx'};
+        foreach my $id ( @{$cmt->{'children'}} ) {
+            next unless exists $commit{$id};
+            if ( $commit{$id}{'merge'} and $top > $commit{$id}{'idx'} ) {
+                $top = $commit{$id}{'idx'};
+            }
+        }
+
+        # 사용하던 컬럼 반환
+        verbose("  free column [$print{$src}{column}] at index [$top]\n");
+        free_col( $print{$src}{'column'}, $top );
+    }
+
+    $last_color = $print{$src}{'color'};
+} #}}}
+verbose("PHASE 3 : done.\n\n\n");
+
+
+
+# 출력
+{ #{{{
+    my $HEAD_id = `git rev-list -1 HEAD`;
+    $HEAD_id = substr($HEAD_id, 0, 7);
+
+    my $idx = 0;
+    open my $less, '|-', 'less -RFfX';
+    my $maxc = 1 + max_col();
+    my @nextline = (' ')x($GAP*$maxc);
+
+    foreach my $id ( @timeline ) {
+        my @currentline = @nextline;
+        $idx++;
+
+        my $cmt = $commit{$id};
+        my $prt = $print{$cmt->{'src'}};
+        my $color = '3'.$prt->{'color'};
+
+        # 출력할 마크
+        my $symbol;
+        if ( $cmt->{merge} ) {
+            $symbol = 'M';
+        }
+        else {
+            $symbol = 'O';
+        }
+
+        if ( $cmt->{head} ) {
+            $symbol = colored_symbol($symbol, 103);
+        }
+        # 출력할 컬럼
+        my $indent = $GAP * $prt->{'column'};
+
+        # 마크를 해당 컬럼에 표시
+        $currentline[$indent] = colored_symbol($symbol, $color);
+
+        # 다음 라인 해당 컬럼에 표시될 마크 결정
+        if ( @{$cmt->{parents}} ) {
+            if ( grep { exists $commit{$_} } @{$cmt->{parents}} ) {
+                $nextline[$indent] = colored_symbol('|', $color);
+            }
+            else {
+                # parent의 id는 있는데 실제 커밋은 없는 경우
+                $nextline[$indent] = colored_symbol('^', $color);
+            }
+        }
+        else {
+            $nextline[$indent] = ' ';
+        }
+
+        # 분기하는 커밋은 가로줄 출력
+        foreach my $s ( @{$cmt->{children}} ) {
+            next if ( not exists $commit{$s} );
+            my $c = $commit{$s};
+            my $b = $c->{'src'};
+
+            # 자식이 자기와 같은 브랜치인 경우 패스
+            next if ( $cmt->{'src'} eq $b );
+
+            # 자식이 merge 커밋이면 패스
+            next if ( $c->{'merge'} );
+
+            my $col = $GAP*$print{$b}{'column'};
+            $currentline[$col] = colored_symbol('^', '3'.$print{$b}{'color'});
+
+            foreach my $i ( $indent < $col ? ( $indent+1 .. $col-1 ) : ( $col+1 .. $indent-1 ) ) {
+                # '-'를 그리면서 그 아래 라인까지 세팅하는 부분. 점검이 필요하다.
+                if ( $currentline[$i] =~ /[ |]/ ) {
+                    $nextline[$i] = $currentline[$i];
+                    $currentline[$i] = colored_symbol('-', $color);
+                }
+            }
+        }
+
+        # "^" 표시 아래는 빈 칸
+        # "|" 표시 아래는 계속 "|"
+        for ( my $i=0; $i<@currentline; $i++ ) {
+            $nextline[$i] = ' ' if $currentline[$i] =~ /\^/;
+            $nextline[$i] = $currentline[$i] if $currentline[$i] =~ /\|/;
+        }
+
+        # 출력
+        printf{$less} "%5d. ", $idx if $VERBOSE;
+        print {$less} join('', @currentline);
+
+        (my $tmp_src = $cmt->{'src'}) =~ s{^(.).*?/}{($1) };    # heads/ tags/ 등은 (h),(t)로
+        (my $tmp_msg = $cmt->{'msg'}) =~ s{\(($pat_color)}{colored_symbol('(', 33).$1}e;
+
+        my $line = '';
+        if ( $id eq $HEAD_id ) {
+            $line .= colored_symbol('*'.$cmt->{'sha_id_p'}, 103);
+        }
+        else {
+            $line .= ' '. $cmt->{'sha_id_p'};
+        }
+        $line .= " " . colored_symbol($tmp_src, $color);
+        $line .= " " . $tmp_msg unless $opt{'no-msg'};
+        $line =~ s/$pat_color//g unless $COLOR;
+
+        print {$less} $line;
+        print {$less} "\n";
+
+        # merge 커밋인 경우는 한 줄 더 출력
+        if ( $cmt->{'merge'} and $cmt->{'idx'} != @timeline ) {
+            my @templine = (' ')x($GAP*$maxc);
+            for (my $i=0; $i<@currentline; $i++) {
+                $templine[$i] = $nextline[$i] if $nextline[$i] =~ /[|]/;
+            }
+
+            $templine[$indent] = colored_symbol('+', $color);
+
+            # merge 커밋의 경우 자신과 같은 브랜치의 부모가 없을 수 있다 (source 값이 바뀌어버림)
+            # 일반 커밋은 아래에서 분기 표시를 하기 위해서 '|'를 출력하지만,
+            # merge 커밋은 하지 말자
+            if ( not grep { exists $commit{$_} and $cmt->{'src'} eq $commit{$_}{'src'} } @{$cmt->{parents}} ) {
+                $nextline[$indent] = ' ';
+            }
+
+            # parent와 merge커밋 사이의 컬럼의 폭을 계산해서, 제일 바깥쪽부터 처리하며 '-'를 덧씌운다.
+            my $col_diff = sub {
+                                 my $id = shift;
+                                 return abs( $indent - $print{$commit{$id}{'src'}}{'column'} );
+                               };
+
+            foreach my $s ( sort { $col_diff->($b) <=> $col_diff->($a) }
+                            grep { exists $commit{$_} } @{$cmt->{'parents'}} ) {
+                my $c = $commit{$s};
+                my $b = $c->{'src'};
+                next if ( $cmt->{'src'} eq $b );
+
+                my $temp_color = '3'.$print{$b}{'color'};
+                my $bcol = $GAP*$print{$b}{'column'};
+
+                $templine[$bcol] = colored_symbol('.', $temp_color);
+                $nextline[$bcol] = colored_symbol('|', $temp_color);
+
+                foreach my $i ( $indent < $bcol ? ( $indent+1 .. $bcol-1 ) : ( $bcol+1 .. $indent-1 ) ) {
+                    $templine[$i] = colored_symbol('-', $temp_color);
+                }
+
+            }
+            printf {$less} "%7s", '' if $VERBOSE;
+            print  {$less} join('', @templine), "\n";
+        }
+    }
+    close $less;
+} #}}}
+
+
+#pod
+#{{{
+
+=pod
+
+=head1 SYNOPSIS
+
+git-fancy [<options>] [-- <git-log options>]
+
+<optons>:
+
+=over 8
+
+=item B<-?, --help>
+
+brief help message
+
+=item B<--man>
+
+full documentation
+
+=item B<--compact>
+
+draw entire graph using as small columns as possible (default)
+
+=item B<--no-compact>
+
+draw every new branch lines at new column
+
+=item B<--gap <positive num>>
+
+gap between lines (default is 2)
+
+=item B<--spilt-merge>
+
+draw merged commits without any reference as different branch (default)
+
+(If you feel the scripts is too slow, turn this off)
+
+=item B<--no-split-merge>
+
+draw merged commits without any reference as same branch as their children
+
+=item B<--no-color>
+
+print without ANSI terminal color
+
+=item B<--no-msg>, B<--no-message>
+
+suppress commit messages
+
+=item B<--verbose>
+
+be verbose
+
+=back
+
+=head1 OPTIONS AND ARGUMENTS
+
+Some examples:
+
+=over 8
+
+=item * git-fancygraph.pl
+
+=item * git-fancygraph.pl --no-compact --gap 4
+
+=item * git-fancygraph.pl --gap 3 -- master release
+
+Show the commits reachable from 'master' and 'release' branches(or, tags).
+
+=item * git-fancygraph.pl -- -- README
+
+Show the commits that are relevant to the 'README' file.
+
+(Notes the second C<--> would be passed to c<git-merge>)
+
+=back
+
+=head1 DESCRIPTION
+
+B<git-fancygraph.pl> shows the commit log of git repository.
+
+It tries its best to draw each branch as "straight line".
+
+There may be any bug I couldn't find.
+
+=head1 TODO
+
+=over 8
+
+=item * Manage encoding of commit messages.
+
+=item * Find bugs :-)
+
+=back
+
+
+
+=head1 AUTHOR AND COPYRIGHT
+
+Geunyoung Park <gypark@gmail.com>
+
+Copyright (c) 2012 Geunyoung Park. All rights reserved.
+
+This program is free software; you can redistribute it and/or modify it under the same terms as Perl itself.
+
+=cut
+
+#}}}
