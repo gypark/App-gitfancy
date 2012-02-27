@@ -1,7 +1,7 @@
 package App::gitfancy;
 use strict;
 use warnings;
-# ABSTRACT: shows `git log` with more readable graph
+# ABSTRACT: shows `git log` with a more readable graph
 
 1;
 
