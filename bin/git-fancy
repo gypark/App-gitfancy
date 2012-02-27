@@ -543,11 +543,11 @@ verbose("PHASE 3 : done.\n\n\n");
 	% git fancy --no-compact
 
 	# show logs of commits that are reachable from some branches or tags
-	# (All arguments after C<--> are passed to B<git-log>)
+	# (All arguments after -- are passed to git-log)
 	% git fancy -- master release devel
 
 	# show logs of commits that are relevant to 'README' file
-	# (Note that the second C<--> is passed to B<git-log> as is)
+	# (Note that the second -- is passed to git-log as is)
 	% git fancy -- -- README
 
 =head1 DESCRIPTION
