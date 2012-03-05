@@ -565,45 +565,45 @@ B<git-fancy> uses L<less(1)> as pager. B<git> and B<less> should be in your PATH
 
 =over
 
-=item C<--compact>
+=item C<< --compact >>
 
 draw entire graph using as few columns as possible (default)
 
-=item C<--no-compact>
+=item C<< --no-compact >>
 
 draw every new branch lines at new column
 
-=item C<--gap <positive num>>
+=item C<< --gap <positive num> >>
 
 gap between lines (default is 2)
 
-=item C<--spilt-merge>
+=item C<< --spilt-merge >>
 
 draw merged commits without any reference as different branch (default)
 
 (If you feel the scripts is too slow, turn this off)
 
-=item C<--no-split-merge>
+=item C<< --no-split-merge >>
 
 draw merged commits without any reference as if they are of same branch.
 
-=item C<--no-color>
+=item C<< --no-color >>
 
 print without ANSI terminal color
 
-=item C<--no-msg>, C<--no-message>
+=item C<< --no-msg >>, C<< --no-message >>
 
 suppress commit messages
 
-=item C<--verbose>
+=item C<< --verbose >>
 
 be verbose
 
-=item C<-?, --help>
+=item C<< -? >>, C<< --help >>
 
 show brief help message
 
-=item C<--man>
+=item C<< --man >>
 
 show full documentation
 

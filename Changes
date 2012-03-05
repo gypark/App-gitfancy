@@ -2,6 +2,9 @@ Release history for App-gitfancy
 
 {{ $NEXT }}
 
+0.003     2012-03-05 23:33:34 Asia/Seoul
+    Fix POD.
+
 0.002     2012-02-28 04:30:18 Asia/Seoul
     Fix POD.
 
